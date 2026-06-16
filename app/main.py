@@ -1,16 +1,21 @@
 import base64
 import os
+import secrets
 import shutil
 import subprocess
 from pathlib import Path
 from uuid import uuid4
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import APIKeyHeader
 from fastapi.staticfiles import StaticFiles
 from openai import OpenAI, OpenAIError
 from pydantic import BaseModel, Field
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
 
 
 load_dotenv()
@@ -31,11 +36,53 @@ REAL_ESRGAN_TIMEOUT_SECONDS = int(os.getenv("REAL_ESRGAN_TIMEOUT_SECONDS", "900"
 REAL_ESRGAN_TILE_SIZE = os.getenv("REAL_ESRGAN_TILE_SIZE")
 ALLOWED_UPLOAD_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp"}
 
+API_KEY_HEADER_NAME = "X-API-Key"
+API_KEYS = {
+    key.strip()
+    for key in os.getenv("API_KEYS", "").split(",")
+    if key.strip()
+}
+
+api_key_header = APIKeyHeader(name=API_KEY_HEADER_NAME, auto_error=False)
+
+CORS_ALLOW_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv("CORS_ALLOW_ORIGINS", "").split(",")
+    if origin.strip()
+]
+
+RATE_LIMIT = os.getenv("RATE_LIMIT", "20/minute")
+
+
+def require_api_key(provided_key: str | None = Depends(api_key_header)) -> None:
+    if not API_KEYS:
+        raise HTTPException(
+            status_code=500,
+            detail="API_KEYS is not configured on the server.",
+        )
+
+    if not provided_key or not any(
+        secrets.compare_digest(provided_key, allowed) for allowed in API_KEYS
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail=f"Missing or invalid {API_KEY_HEADER_NAME} header.",
+        )
+
+
+def rate_limit_key(request: Request) -> str:
+    return request.headers.get(API_KEY_HEADER_NAME) or get_remote_address(request)
+
+
+limiter = Limiter(key_func=rate_limit_key)
+
 app = FastAPI(title="OpenAI Image Generator API")
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=CORS_ALLOW_ORIGINS,
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -100,7 +147,12 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.post("/generate-image", response_model=ImageGenerateResponse)
+@app.post(
+    "/generate-image",
+    response_model=ImageGenerateResponse,
+    dependencies=[Depends(require_api_key)],
+)
+@limiter.limit(RATE_LIMIT)
 def generate_image(payload: ImageGenerateRequest, request: Request) -> ImageGenerateResponse:
     model = payload.model or DEFAULT_MODEL
     openai_client = get_openai_client()
@@ -135,7 +187,12 @@ def generate_image(payload: ImageGenerateRequest, request: Request) -> ImageGene
     )
 
 
-@app.post("/upscale-image", response_model=ImageUpscaleResponse)
+@app.post(
+    "/upscale-image",
+    response_model=ImageUpscaleResponse,
+    dependencies=[Depends(require_api_key)],
+)
+@limiter.limit(RATE_LIMIT)
 async def upscale_image(
     request: Request,
     image: UploadFile = File(...),
