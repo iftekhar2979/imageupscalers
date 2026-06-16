@@ -1,0 +1,215 @@
+import base64
+import os
+import shutil
+import subprocess
+from pathlib import Path
+from uuid import uuid4
+
+from dotenv import load_dotenv
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from openai import OpenAI, OpenAIError
+from pydantic import BaseModel, Field
+
+
+load_dotenv()
+
+IMAGE_DIR = Path(os.getenv("GENERATED_IMAGE_DIR", "generated_images"))
+IMAGE_DIR.mkdir(parents=True, exist_ok=True)
+
+UPSCALED_IMAGE_DIR = Path(os.getenv("UPSCALED_IMAGE_DIR", "upscaled_images"))
+UPSCALED_IMAGE_DIR.mkdir(parents=True, exist_ok=True)
+
+DEFAULT_MODEL = os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-1.5")
+DEFAULT_SIZE = "1024x1024"
+DEFAULT_QUALITY = "auto"
+REAL_ESRGAN_EXECUTABLE = os.getenv("REAL_ESRGAN_EXECUTABLE", "realesrgan-ncnn-vulkan")
+REAL_ESRGAN_MODEL = os.getenv("REAL_ESRGAN_MODEL", "realesrgan-x4plus")
+REAL_ESRGAN_MODELS_DIR = os.getenv("REAL_ESRGAN_MODELS_DIR")
+REAL_ESRGAN_TIMEOUT_SECONDS = int(os.getenv("REAL_ESRGAN_TIMEOUT_SECONDS", "900"))
+REAL_ESRGAN_TILE_SIZE = os.getenv("REAL_ESRGAN_TILE_SIZE")
+ALLOWED_UPLOAD_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp"}
+
+app = FastAPI(title="OpenAI Image Generator API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.mount("/generated", StaticFiles(directory=str(IMAGE_DIR)), name="generated")
+app.mount("/upscaled", StaticFiles(directory=str(UPSCALED_IMAGE_DIR)), name="upscaled")
+
+
+class ImageGenerateRequest(BaseModel):
+    prompt: str = Field(..., min_length=1, max_length=32000)
+    model: str | None = Field(default=None, examples=["gpt-image-1.5"])
+    size: str = Field(default=DEFAULT_SIZE, examples=["1024x1024"])
+    quality: str = Field(default=DEFAULT_QUALITY, examples=["auto", "low", "medium", "high"])
+
+
+class ImageGenerateResponse(BaseModel):
+    image_url: str
+    model: str
+    saved: bool
+
+
+class ImageUpscaleResponse(BaseModel):
+    image_url: str
+    scale: int
+    model: str
+    saved: bool
+
+
+def get_openai_client() -> OpenAI:
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not configured.")
+    return OpenAI(api_key=api_key)
+
+
+def resolve_realesrgan_executable() -> str:
+    configured_path = Path(REAL_ESRGAN_EXECUTABLE)
+    if configured_path.exists():
+        return str(configured_path)
+
+    executable = shutil.which(REAL_ESRGAN_EXECUTABLE)
+    if executable:
+        return executable
+
+    if not REAL_ESRGAN_EXECUTABLE.lower().endswith(".exe"):
+        executable = shutil.which(f"{REAL_ESRGAN_EXECUTABLE}.exe")
+        if executable:
+            return executable
+
+    raise HTTPException(
+        status_code=500,
+        detail=(
+            "Real-ESRGAN executable was not found. Set REAL_ESRGAN_EXECUTABLE "
+            "to the full path of realesrgan-ncnn-vulkan.exe."
+        ),
+    )
+
+
+@app.get("/health")
+def health() -> dict[str, str]:
+    return {"status": "ok"}
+
+
+@app.post("/generate-image", response_model=ImageGenerateResponse)
+def generate_image(payload: ImageGenerateRequest, request: Request) -> ImageGenerateResponse:
+    model = payload.model or DEFAULT_MODEL
+    openai_client = get_openai_client()
+
+    try:
+        result = openai_client.images.generate(
+            model=model,
+            prompt=payload.prompt,
+            size=payload.size,
+            quality=payload.quality,
+            n=1,
+        )
+    except OpenAIError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    image = result.data[0]
+
+    if image.url:
+        return ImageGenerateResponse(image_url=image.url, model=model, saved=False)
+
+    if not image.b64_json:
+        raise HTTPException(status_code=502, detail="OpenAI returned no image data.")
+
+    filename = f"{uuid4().hex}.png"
+    output_path = IMAGE_DIR / filename
+    output_path.write_bytes(base64.b64decode(image.b64_json))
+
+    return ImageGenerateResponse(
+        image_url=str(request.url_for("generated", path=filename)),
+        model=model,
+        saved=True,
+    )
+
+
+@app.post("/upscale-image", response_model=ImageUpscaleResponse)
+async def upscale_image(
+    request: Request,
+    image: UploadFile = File(...),
+    scale: int = Form(..., ge=2, le=4),
+) -> ImageUpscaleResponse:
+    if scale not in {2, 4}:
+        raise HTTPException(status_code=400, detail="Scale must be either 2 or 4.")
+
+    suffix = Path(image.filename or "").suffix.lower()
+    if suffix not in ALLOWED_UPLOAD_SUFFIXES:
+        raise HTTPException(status_code=400, detail="Upload a PNG, JPG, JPEG, or WEBP image.")
+
+    executable = resolve_realesrgan_executable()
+    input_path = UPSCALED_IMAGE_DIR / f"{uuid4().hex}{suffix}"
+    output_filename = f"{uuid4().hex}.png"
+    output_path = UPSCALED_IMAGE_DIR / output_filename
+    upload_bytes = await image.read()
+
+    if not upload_bytes:
+        raise HTTPException(status_code=400, detail="Uploaded image is empty.")
+
+    try:
+        input_path.write_bytes(upload_bytes)
+
+        command = [
+            executable,
+            "-i",
+            str(input_path),
+            "-o",
+            str(output_path),
+            "-s",
+            str(scale),
+            "-n",
+            REAL_ESRGAN_MODEL,
+            "-f",
+            "png",
+        ]
+
+        if REAL_ESRGAN_MODELS_DIR:
+            command.extend(["-m", REAL_ESRGAN_MODELS_DIR])
+
+        if REAL_ESRGAN_TILE_SIZE:
+            command.extend(["-t", REAL_ESRGAN_TILE_SIZE])
+
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=REAL_ESRGAN_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise HTTPException(
+            status_code=504,
+            detail=(
+                f"Real-ESRGAN timed out after {REAL_ESRGAN_TIMEOUT_SECONDS} seconds. "
+                "Try a smaller image, use scale=2, or increase REAL_ESRGAN_TIMEOUT_SECONDS."
+            ),
+        ) from exc
+    finally:
+        input_path.unlink(missing_ok=True)
+
+    if completed.returncode != 0:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Real-ESRGAN failed: {completed.stderr or completed.stdout}",
+        )
+
+    if not output_path.exists():
+        raise HTTPException(status_code=502, detail="Real-ESRGAN did not create an output image.")
+
+    return ImageUpscaleResponse(
+        image_url=str(request.url_for("upscaled", path=output_filename)),
+        scale=scale,
+        model=REAL_ESRGAN_MODEL,
+        saved=True,
+    )
