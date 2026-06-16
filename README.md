@@ -17,6 +17,17 @@ Edit `.env` and set:
 
 ```env
 OPENAI_API_KEY=your_openai_api_key_here
+API_KEYS=changeme-generate-a-strong-key
+```
+
+## Authentication
+
+The `/generate-image` and `/upscale-image` endpoints require a gateway API key. Set one or more keys in `API_KEYS` (comma-separated to issue a key per client), and send the key in the `X-API-Key` header on every request. Requests without a valid key get `401 Unauthorized`. The `/health` endpoint and the `/generated` and `/upscaled` image routes stay public.
+
+Generate a strong key, for example:
+
+```powershell
+python -c "import secrets; print(secrets.token_urlsafe(32))"
 ```
 
 ## Run
@@ -38,6 +49,7 @@ Invoke-RestMethod `
   -Method Post `
   -Uri http://127.0.0.1:8000/generate-image `
   -ContentType "application/json" `
+  -Headers @{ "X-API-Key" = "changeme-generate-a-strong-key" } `
   -Body '{"prompt":"A clean product photo of a matte black smart speaker on a white desk"}'
 ```
 
@@ -101,6 +113,7 @@ Upload and upscale an image by 2x:
 
 ```powershell
 curl.exe -X POST `
+  -H "X-API-Key: changeme-generate-a-strong-key" `
   -F "image=@C:\path\to\input.png" `
   -F "scale=2" `
   http://127.0.0.1:8000/upscale-image
@@ -110,6 +123,7 @@ Upload and upscale an image by 4x:
 
 ```powershell
 curl.exe -X POST `
+  -H "X-API-Key: changeme-generate-a-strong-key" `
   -F "image=@C:\path\to\input.png" `
   -F "scale=4" `
   http://127.0.0.1:8000/upscale-image
