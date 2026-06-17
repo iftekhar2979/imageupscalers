@@ -22,7 +22,7 @@ API_KEYS=changeme-generate-a-strong-key
 
 ## Authentication
 
-The `/generate-image` and `/upscale-image` endpoints require a gateway API key. Set one or more keys in `API_KEYS` (comma-separated to issue a key per client), and send the key in the `X-API-Key` header on every request. Requests without a valid key get `401 Unauthorized`. The `/health` endpoint and the `/generated` and `/upscaled` image routes stay public.
+The `/generate-image`, `/upscale-image`, and `/edit-image` endpoints require a gateway API key. Set one or more keys in `API_KEYS` (comma-separated to issue a key per client), and send the key in the `X-API-Key` header on every request. Requests without a valid key get `401 Unauthorized`. The `/health` endpoint and the `/generated` and `/upscaled` image routes stay public.
 
 Generate a strong key, for example:
 
@@ -64,6 +64,50 @@ Example response:
 ```
 
 Open the returned `image_url` in a browser to view the generated image.
+
+## Edit An Image
+
+`POST /edit-image` accepts multipart form data and edits an uploaded image with the OpenAI Images API. It returns the edited image as a base64 data URL, ready to drop straight onto a canvas (no CORS to handle).
+
+Form fields:
+
+- `image` — the uploaded file (PNG, JPG, JPEG, or WEBP). Required.
+- `prompt` — free-text edit instruction. Required unless `action` is given.
+- `action` — optional preset: `remove_background`, `transparent_logo`, or `enhance`. The `remove_background` and `transparent_logo` presets produce a transparent background. Combine with `prompt` to add extra instructions.
+- `size` — optional output size, defaults to `1024x1024`.
+
+Remove a background:
+
+```powershell
+curl.exe -X POST `
+  -H "X-API-Key: changeme-generate-a-strong-key" `
+  -F "image=@C:\path\to\product.png" `
+  -F "action=remove_background" `
+  http://127.0.0.1:8000/edit-image
+```
+
+Edit with a custom prompt:
+
+```powershell
+curl.exe -X POST `
+  -H "X-API-Key: changeme-generate-a-strong-key" `
+  -F "image=@C:\path\to\product.png" `
+  -F "prompt=Place the product on a marble countertop with soft daylight" `
+  http://127.0.0.1:8000/edit-image
+```
+
+Example response:
+
+```json
+{
+  "images": [
+    {
+      "dataUrl": "data:image/png;base64,iVBORw0KGgo...",
+      "name": "Edited image"
+    }
+  ]
+}
+```
 
 ## Upscale An Image With Real-ESRGAN
 
