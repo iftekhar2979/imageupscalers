@@ -36,6 +36,19 @@ REAL_ESRGAN_TIMEOUT_SECONDS = int(os.getenv("REAL_ESRGAN_TIMEOUT_SECONDS", "900"
 REAL_ESRGAN_TILE_SIZE = os.getenv("REAL_ESRGAN_TILE_SIZE")
 ALLOWED_UPLOAD_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp"}
 
+EDIT_ACTION_PROMPTS = {
+    "remove_background": (
+        "Remove the background entirely, keeping only the main subject with clean, precise edges."
+    ),
+    "transparent_logo": (
+        "Isolate the logo and remove everything else, producing a clean logo on a transparent background."
+    ),
+    "enhance": (
+        "Enhance the image: improve sharpness, lighting, and detail without changing the subject or composition."
+    ),
+}
+EDIT_TRANSPARENT_ACTIONS = {"remove_background", "transparent_logo"}
+
 API_KEY_HEADER_NAME = "X-API-Key"
 API_KEYS = {
     key.strip()
@@ -110,6 +123,15 @@ class ImageUpscaleResponse(BaseModel):
     scale: int
     model: str
     saved: bool
+
+
+class EditedImage(BaseModel):
+    dataUrl: str
+    name: str
+
+
+class ImageEditResponse(BaseModel):
+    images: list[EditedImage]
 
 
 def get_openai_client() -> OpenAI:
@@ -269,4 +291,71 @@ async def upscale_image(
         scale=scale,
         model=REAL_ESRGAN_MODEL,
         saved=True,
+    )
+
+
+@app.post(
+    "/edit-image",
+    response_model=ImageEditResponse,
+    dependencies=[Depends(require_api_key)],
+)
+@limiter.limit(RATE_LIMIT)
+async def edit_image(
+    request: Request,
+    image: UploadFile = File(...),
+    prompt: str = Form(""),
+    action: str | None = Form(None),
+    size: str = Form(DEFAULT_SIZE),
+) -> ImageEditResponse:
+    if action is not None and action not in EDIT_ACTION_PROMPTS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown action. Choose one of: {', '.join(sorted(EDIT_ACTION_PROMPTS))}.",
+        )
+
+    suffix = Path(image.filename or "").suffix.lower()
+    if suffix not in ALLOWED_UPLOAD_SUFFIXES:
+        raise HTTPException(status_code=400, detail="Upload a PNG, JPG, JPEG, or WEBP image.")
+
+    prompt_parts = []
+    if action:
+        prompt_parts.append(EDIT_ACTION_PROMPTS[action])
+    if prompt.strip():
+        prompt_parts.append(prompt.strip())
+    if not prompt_parts:
+        raise HTTPException(status_code=400, detail="Provide a prompt or an action.")
+    effective_prompt = " ".join(prompt_parts)
+
+    upload_bytes = await image.read()
+    if not upload_bytes:
+        raise HTTPException(status_code=400, detail="Uploaded image is empty.")
+
+    edit_kwargs = {
+        "model": DEFAULT_MODEL,
+        "image": (image.filename or f"upload{suffix}", upload_bytes),
+        "prompt": effective_prompt,
+        "size": size,
+        "n": 1,
+    }
+    if action in EDIT_TRANSPARENT_ACTIONS:
+        edit_kwargs["background"] = "transparent"
+
+    openai_client = get_openai_client()
+
+    try:
+        result = openai_client.images.edit(**edit_kwargs)
+    except OpenAIError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    edited = result.data[0]
+    if not edited.b64_json:
+        raise HTTPException(status_code=502, detail="OpenAI returned no image data.")
+
+    return ImageEditResponse(
+        images=[
+            EditedImage(
+                dataUrl=f"data:image/png;base64,{edited.b64_json}",
+                name="Edited image",
+            )
+        ]
     )
